@@ -9,6 +9,7 @@ done
 _modules="
 	bassoptions
 	presets
+	existinginstall
 	"
 
 cd src/modules

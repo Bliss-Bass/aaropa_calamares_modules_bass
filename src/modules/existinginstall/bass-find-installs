@@ -1,0 +1,206 @@
+#!/bin/bash
+# bass-find-installs [--new SYSTEM_IMAGE]
+#
+# Lists installed Bass OS / BlissOS systems for the existinginstall Calamares page.
+# Partitions are only mounted read-only. One tab-separated line per finding:
+#
+#   install  device=  uuid=  fs=  disk=  label=  size=  slot=  sdk=  release=  date=
+#            display=  data=img|dir|none  esp_uuid=  efi_id=
+#   mbr      disk=  owner=empty|grub|windows|other  live=0|1   (every disk; used on BIOS)
+#   new      sdk=  release=  date=  display=              (with --new)
+#
+# An install is a filesystem with boot/grub/android.cfg plus kernel, initrd and system
+# image of its slot (same rule as the live USB repair menu).
+# BFI_LIB=1 only defines the functions (host tests).
+
+BFI_FS_TYPES=" ext2 ext3 ext4 vfat exfat ntfs ntfs3 f2fs btrfs xfs "
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+
+bfi_prop() {
+	# bfi_prop FILE KEY
+	awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null
+}
+
+bfi_clean() {
+	# Values must not break the key=value<TAB> format.
+	printf '%s' "$1" | tr -d '\t\r\n'
+}
+
+# Prints build.prop of a system image on stdout.
+bfi_image_build_prop() {
+	local img=$1 out mnt
+	for out in /system/build.prop /build.prop; do
+		if debugfs -R "cat $out" "$img" 2>/dev/null | grep -q '^ro\.'; then
+			debugfs -R "cat $out" "$img" 2>/dev/null
+			return 0
+		fi
+	done
+	# erofs or other images: loop mount
+	mnt=$(mktemp -d) || return 1
+	if mount -o ro,loop "$img" "$mnt" 2>/dev/null; then
+		cat "$mnt"/system/build.prop "$mnt"/build.prop 2>/dev/null | grep '^ro\.'
+		umount "$mnt"
+	fi
+	rmdir "$mnt"
+}
+
+bfi_version_fields() {
+	# bfi_version_fields SYSTEM_IMAGE -> "sdk=..<TAB>release=..<TAB>date=..<TAB>display=.."
+	local prop
+	prop=$(mktemp) || return 1
+	bfi_image_build_prop "$1" >"$prop"
+	printf 'sdk=%s\trelease=%s\tdate=%s\tdisplay=%s' \
+		"$(bfi_clean "$(bfi_prop "$prop" ro.build.version.sdk)")" \
+		"$(bfi_clean "$(bfi_prop "$prop" ro.build.version.release)")" \
+		"$(bfi_clean "$(bfi_prop "$prop" ro.build.date.utc)")" \
+		"$(bfi_clean "$(bfi_prop "$prop" ro.build.display.id)")"
+	rm -f "$prop"
+}
+
+bfi_slot() {
+	local slot
+	slot=$(sed -n "s/^SLOT=\(_[ab]\)[[:space:]]*$/\1/p" "$1"/boot/grub/android.cfg 2>/dev/null | head -1)
+	printf '%s' "${slot:-_a}"
+}
+
+bfi_is_install() {
+	local root=$1 slot
+	[ -f "$root"/boot/grub/android.cfg ] || return 1
+	slot=$(bfi_slot "$root")
+	[ -f "$root/kernel$slot" ] && [ -f "$root/initrd$slot.img" ] && [ -f "$root/system$slot.img" ]
+}
+
+# Same choice as aaropa_calamares scripts/gen-img: data.img unless the previous
+# fstab.android mounted a non-empty data/ directory.
+bfi_data_kind() {
+	local root=$1 img=false dir=false
+	[ -f "$root"/data.img ] && img=true
+	[ -d "$root"/data ] && [ -n "$(ls -A "$root"/data 2>/dev/null)" ] && dir=true
+	if $img && $dir && grep -Eq '^\$FS/data[[:space:]]+userdata' "$root"/fstab.android 2>/dev/null; then
+		img=false
+	fi
+	if $img; then
+		echo img
+	elif $dir; then
+		echo dir
+	else
+		echo none
+	fi
+}
+
+bfi_esp_uuid() {
+	awk '$1 ~ /^UUID=/ && $2 == "/boot/efi" { sub(/^UUID=/, "", $1); print $1; exit }' \
+		"$1"/fstab.android 2>/dev/null
+}
+
+# bfi_efi_id ESP_ROOT ROOT_UUID: EFI/<id> whose loader or grub.cfg references the root
+# filesystem (grub-install embeds "search.fs_uuid <uuid>" in grubx64.efi).
+bfi_efi_id() {
+	local esp=$1 uuid=$2 efi dir
+	[ -n "$uuid" ] || return 0
+	for efi in "$esp"/[Ee][Ff][Ii]; do
+		[ -d "$efi" ] || continue
+		for dir in "$efi"/*/; do
+			dir=${dir%/}
+			case "${dir##*/}" in [Bb][Oo][Oo][Tt]) continue ;; esac
+			if grep -rlaF -- "$uuid" "$dir" >/dev/null 2>&1; then
+				printf '%s' "${dir##*/}"
+				return 0
+			fi
+		done
+	done
+}
+
+# bfi_probe_root ROOT: prints the install fields that come from the filesystem itself.
+bfi_probe_root() {
+	local root=$1 slot
+	slot=$(bfi_slot "$root")
+	printf 'slot=%s\t%s\tdata=%s\tesp_uuid=%s' "$slot" \
+		"$(bfi_version_fields "$root/system$slot.img")" \
+		"$(bfi_data_kind "$root")" "$(bfi_clean "$(bfi_esp_uuid "$root")")"
+}
+
+bfi_mbr_owner() {
+	local code
+	code=$(head -c 440 "$1" 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+	if [ -z "$code" ] || [ -z "${code//0/}" ]; then
+		echo empty
+		return
+	fi
+	if head -c 440 "$1" | grep -qa GRUB; then
+		echo grub
+	elif head -c 440 "$1" | grep -qaE 'Invalid partition table|Missing operating system'; then
+		echo windows
+	else
+		echo other
+	fi
+}
+
+# bfi_with_mount DEV FN ARGS...: runs FN MOUNTPOINT ARGS... with DEV mounted read-only.
+bfi_with_mount() {
+	local dev=$1 fn=$2 mnt ret
+	shift 2
+	mnt=$(findmnt -rno TARGET -S "$dev" 2>/dev/null | head -1)
+	if [ -n "$mnt" ]; then
+		"$fn" "$mnt" "$@"
+		return
+	fi
+	mnt=$(mktemp -d) || return 1
+	if ! mount -o ro "$dev" "$mnt" 2>/dev/null; then
+		rmdir "$mnt"
+		return 1
+	fi
+	"$fn" "$mnt" "$@"
+	ret=$?
+	umount "$mnt" 2>/dev/null || umount -l "$mnt"
+	rmdir "$mnt"
+	return $ret
+}
+
+bfi_install_line() {
+	local root=$1 dev=$2 uuid=$3 fs=$4 disk=$5 label=$6 size=$7 fields esp_uuid efi_id="" esp
+	bfi_is_install "$root" || return 1
+	fields=$(bfi_probe_root "$root")
+	esp_uuid=${fields##*esp_uuid=}
+	if [ -n "$esp_uuid" ]; then
+		esp=$(blkid -U "$esp_uuid" 2>/dev/null)
+		[ -n "$esp" ] && efi_id=$(bfi_with_mount "$esp" bfi_efi_id "$uuid")
+	fi
+	printf 'install\tdevice=%s\tuuid=%s\tfs=%s\tdisk=%s\tlabel=%s\tsize=%s\t%s\tefi_id=%s\n' \
+		"$dev" "$uuid" "$fs" "$disk" "$(bfi_clean "$label")" "$size" "$fields" "$(bfi_clean "$efi_id")"
+}
+
+bfi_live_disk() {
+	local src disk
+	src=$(findmnt -rno SOURCE /cdrom 2>/dev/null | head -1)
+	[ -b "$src" ] || return 0
+	disk=$(lsblk -dnpo PKNAME "$src" 2>/dev/null)
+	printf '%s' "${disk:-$src}"
+}
+
+bfi_main() {
+	local line live NAME TYPE FSTYPE UUID PKNAME SIZE LABEL
+	if [ "$1" = --new ] && [ -n "$2" ]; then
+		[ -f "$2" ] && printf 'new\t%s\n' "$(bfi_version_fields "$2")"
+	fi
+	live=$(bfi_live_disk)
+
+	# -P quotes every value and escapes shell-special characters as \xNN.
+	lsblk -nbpP -o NAME,TYPE,FSTYPE,UUID,PKNAME,SIZE,LABEL 2>/dev/null |
+		while read -r line; do
+			eval "$line"
+			case "$TYPE" in
+			disk)
+				printf 'mbr\tdisk=%s\towner=%s\tlive=%s\n' "$NAME" "$(bfi_mbr_owner "$NAME")" \
+					"$([ "$NAME" = "$live" ] && echo 1 || echo 0)"
+				;;
+			part)
+				case "$BFI_FS_TYPES" in *" $FSTYPE "*) ;; *) continue ;; esac
+				bfi_with_mount "$NAME" bfi_install_line "$NAME" "$UUID" "$FSTYPE" "$PKNAME" \
+					"$(printf '%b' "$LABEL")" "$SIZE"
+				;;
+			esac
+		done
+}
+
+[ "${BFI_LIB:-0}" = 1 ] || bfi_main "$@"
