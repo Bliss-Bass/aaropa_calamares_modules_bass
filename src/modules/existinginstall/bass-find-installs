@@ -89,8 +89,25 @@ bfi_data_kind() {
 }
 
 bfi_esp_uuid() {
-	awk '$1 ~ /^UUID=/ && $2 == "/boot/efi" { sub(/^UUID=/, "", $1); print $1; exit }' \
+	# genfstab names the /boot/efi mount "esp" in fstab.android.
+	awk '$1 ~ /^UUID=/ && ($2 == "esp" || $2 == "/boot/efi") { sub(/^UUID=/, "", $1); print $1; exit }' \
 		"$1"/fstab.android 2>/dev/null
+}
+
+# bfi_find_esp ROOT_UUID: "<esp uuid><TAB><efi id>" of the first ESP holding a loader
+# for ROOT_UUID, when fstab.android does not name the ESP.
+bfi_find_esp() {
+	local uuid=$1 line NAME PARTTYPE UUID id
+	[ -n "$uuid" ] || return 0
+	while read -r line; do
+		eval "$line"
+		case "${PARTTYPE,,}" in "$ESP_GUID" | 0xef) ;; *) continue ;; esac
+		id=$(bfi_with_mount "$NAME" bfi_efi_id "$uuid")
+		if [ -n "$id" ]; then
+			printf '%s\t%s' "$UUID" "$id"
+			return 0
+		fi
+	done < <(lsblk -npP -o NAME,PARTTYPE,UUID 2>/dev/null)
 }
 
 # bfi_efi_id ESP_ROOT ROOT_UUID: EFI/<id> whose loader or grub.cfg references the root
@@ -158,13 +175,20 @@ bfi_with_mount() {
 }
 
 bfi_install_line() {
-	local root=$1 dev=$2 uuid=$3 fs=$4 disk=$5 label=$6 size=$7 fields esp_uuid efi_id="" esp
+	local root=$1 dev=$2 uuid=$3 fs=$4 disk=$5 label=$6 size=$7 fields esp_uuid efi_id="" esp found
 	bfi_is_install "$root" || return 1
 	fields=$(bfi_probe_root "$root")
 	esp_uuid=${fields##*esp_uuid=}
 	if [ -n "$esp_uuid" ]; then
 		esp=$(blkid -U "$esp_uuid" 2>/dev/null)
 		[ -n "$esp" ] && efi_id=$(bfi_with_mount "$esp" bfi_efi_id "$uuid")
+	fi
+	if [ -z "$efi_id" ]; then
+		found=$(bfi_find_esp "$uuid")
+		if [ -n "$found" ]; then
+			efi_id=${found#*$'\t'}
+			fields="${fields%esp_uuid=*}esp_uuid=$(bfi_clean "${found%%$'\t'*}")"
+		fi
 	fi
 	printf 'install\tdevice=%s\tuuid=%s\tfs=%s\tdisk=%s\tlabel=%s\tsize=%s\t%s\tefi_id=%s\n' \
 		"$dev" "$uuid" "$fs" "$disk" "$(bfi_clean "$label")" "$size" "$fields" "$(bfi_clean "$efi_id")"
