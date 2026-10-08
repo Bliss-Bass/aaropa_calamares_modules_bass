@@ -5,7 +5,7 @@
 # Partitions are only mounted read-only. One tab-separated line per finding:
 #
 #   install  device=  uuid=  fs=  disk=  label=  size=  slot=  sdk=  release=  date=
-#            display=  data=img|dir|none  esp_uuid=  efi_id=
+#            display=  data=img|dir|none  esp_uuid=  efi_id=  cmdline=
 #   mbr      disk=  owner=empty|grub|windows|other  live=0|1   (every disk; used on BIOS)
 #   new      sdk=  release=  date=  display=              (with --new)
 #
@@ -94,15 +94,98 @@ bfi_esp_uuid() {
 		"$1"/fstab.android 2>/dev/null
 }
 
-# bfi_find_esp ROOT_UUID: "<esp uuid><TAB><efi id>" of the first ESP holding a loader
-# for ROOT_UUID, when fstab.android does not name the ESP.
+bfi_disk_of() {
+	lsblk -dnpo PKNAME "$1" 2>/dev/null
+}
+
+bfi_part_num() {
+	cat "/sys/class/block/${1##*/}/partition" 2>/dev/null
+}
+
+# bfi_prefix_needles ROOT_DEV ESP_DEV: with the ESP on the root's disk, grub-install
+# hardcodes the partition in the core image ("(,gpt2)/boot/grub") instead of
+# "search.fs_uuid <uuid>".
+bfi_prefix_needles() {
+	local n
+	[ -n "$1" ] && [ -n "$2" ] && [ "$(bfi_disk_of "$1")" = "$(bfi_disk_of "$2")" ] || return 0
+	n=$(bfi_part_num "$1")
+	[ -n "$n" ] || return 0
+	printf '(,gpt%s)/boot/grub\n(,msdos%s)/boot/grub\n' "$n" "$n"
+}
+
+# bfi_loader_matches FILE ROOT_UUID NEEDLES...
+bfi_loader_matches() {
+	local f=$1 uuid=$2 n
+	shift 2
+	[ -n "$uuid" ] && grep -aqiF -- "$uuid" "$f" && return 0
+	for n in "$@"; do
+		grep -aqF -- "$n" "$f" && return 0
+	done
+	return 1
+}
+
+# bfi_efi_dirs ESP_ROOT ROOT_UUID NEEDLES...: EFI/<id> directories (not EFI/Boot) with a
+# loader or grub.cfg for the root filesystem.
+bfi_efi_dirs() {
+	local esp=$1 uuid=$2 efi dir f
+	shift 2
+	for efi in "$esp"/[Ee][Ff][Ii]; do
+		[ -d "$efi" ] || continue
+		for dir in "$efi"/*/; do
+			dir=${dir%/}
+			case "${dir##*/}" in [Bb][Oo][Oo][Tt]) continue ;; esac
+			for f in "$dir"/*; do
+				[ -f "$f" ] || continue
+				if bfi_loader_matches "$f" "$uuid" "$@"; then
+					echo "${dir##*/}"
+					break
+				fi
+			done
+		done
+	done
+}
+
+# EFI directory names of the firmware boot entries, in boot order.
+bfi_boot_order_dirs() {
+	local out n
+	out=$(efibootmgr -v 2>/dev/null) || return 0
+	for n in $(sed -n 's/^BootOrder: //p' <<<"$out" | tr ',' ' '); do
+		grep -i "^Boot$n" <<<"$out" | sed -nE 's/.*\\EFI\\([^\\]+)\\.*/\1/Ip' | head -1
+	done
+}
+
+# bfi_efi_id ESP_ROOT ROOT_UUID NEEDLES...: the EFI directory of the install, preferring
+# the one the firmware starts first (old installs may have several).
+bfi_efi_id() {
+	local dirs d o
+	dirs=$(bfi_efi_dirs "$@")
+	[ -n "$dirs" ] || return 0
+	while read -r o; do
+		while read -r d; do
+			if [ -n "$o" ] && [ "${d,,}" = "${o,,}" ]; then
+				printf '%s' "$d"
+				return 0
+			fi
+		done <<<"$dirs"
+	done < <(bfi_boot_order_dirs)
+	printf '%s' "$(head -n1 <<<"$dirs")"
+}
+
+# bfi_esp_efi_id ESP_DEV ROOT_DEV ROOT_UUID
+bfi_esp_efi_id() {
+	local needles=()
+	mapfile -t needles < <(bfi_prefix_needles "$2" "$1")
+	bfi_with_mount "$1" bfi_efi_id "$3" "${needles[@]}"
+}
+
+# bfi_find_esp ROOT_DEV ROOT_UUID: "<esp uuid><TAB><efi id>" of the first ESP holding a
+# loader for the install, when fstab.android does not name the ESP.
 bfi_find_esp() {
-	local uuid=$1 line NAME PARTTYPE UUID id
-	[ -n "$uuid" ] || return 0
+	local root_dev=$1 uuid=$2 line NAME PARTTYPE UUID id
 	while read -r line; do
 		eval "$line"
 		case "${PARTTYPE,,}" in "$ESP_GUID" | 0xef) ;; *) continue ;; esac
-		id=$(bfi_with_mount "$NAME" bfi_efi_id "$uuid")
+		id=$(bfi_esp_efi_id "$NAME" "$root_dev" "$uuid")
 		if [ -n "$id" ]; then
 			printf '%s\t%s' "$UUID" "$id"
 			return 0
@@ -110,22 +193,16 @@ bfi_find_esp() {
 	done < <(lsblk -npP -o NAME,PARTTYPE,UUID 2>/dev/null)
 }
 
-# bfi_efi_id ESP_ROOT ROOT_UUID: EFI/<id> whose loader or grub.cfg references the root
-# filesystem (grub-install embeds "search.fs_uuid <uuid>" in grubx64.efi).
-bfi_efi_id() {
-	local esp=$1 uuid=$2 efi dir
-	[ -n "$uuid" ] || return 0
-	for efi in "$esp"/[Ee][Ff][Ii]; do
-		[ -d "$efi" ] || continue
-		for dir in "$efi"/*/; do
-			dir=${dir%/}
-			case "${dir##*/}" in [Bb][Oo][Oo][Tt]) continue ;; esac
-			if grep -rlaF -- "$uuid" "$dir" >/dev/null 2>&1; then
-				printf '%s' "${dir##*/}"
-				return 0
-			fi
-		done
+# CMDLINE of android.cfg (else android.cfg.good) when GRUB-safe: exactly one quoted
+# CMDLINE without ' " $ ` \ (same rule as the bootcfg module and bass-repair).
+bfi_cmdline() {
+	local f
+	for f in "$1"/boot/grub/android.cfg "$1"/boot/grub/android.cfg.good; do
+		[ -f "$f" ] || continue
+		[ "$(grep -c '^CMDLINE=' "$f")" = 1 ] || continue
+		sed -n "s/^CMDLINE='\([^'\"\$\`\\\\]*\)'\$/\1/p" "$f" | grep . && return 0
 	done
+	return 0
 }
 
 # bfi_probe_root ROOT: prints the install fields that come from the filesystem itself.
@@ -181,17 +258,18 @@ bfi_install_line() {
 	esp_uuid=${fields##*esp_uuid=}
 	if [ -n "$esp_uuid" ]; then
 		esp=$(blkid -U "$esp_uuid" 2>/dev/null)
-		[ -n "$esp" ] && efi_id=$(bfi_with_mount "$esp" bfi_efi_id "$uuid")
+		[ -n "$esp" ] && efi_id=$(bfi_esp_efi_id "$esp" "$dev" "$uuid")
 	fi
 	if [ -z "$efi_id" ]; then
-		found=$(bfi_find_esp "$uuid")
+		found=$(bfi_find_esp "$dev" "$uuid")
 		if [ -n "$found" ]; then
 			efi_id=${found#*$'\t'}
 			fields="${fields%esp_uuid=*}esp_uuid=$(bfi_clean "${found%%$'\t'*}")"
 		fi
 	fi
-	printf 'install\tdevice=%s\tuuid=%s\tfs=%s\tdisk=%s\tlabel=%s\tsize=%s\t%s\tefi_id=%s\n' \
-		"$dev" "$uuid" "$fs" "$disk" "$(bfi_clean "$label")" "$size" "$fields" "$(bfi_clean "$efi_id")"
+	printf 'install\tdevice=%s\tuuid=%s\tfs=%s\tdisk=%s\tlabel=%s\tsize=%s\t%s\tefi_id=%s\tcmdline=%s\n' \
+		"$dev" "$uuid" "$fs" "$disk" "$(bfi_clean "$label")" "$size" "$fields" "$(bfi_clean "$efi_id")" \
+		"$(bfi_clean "$(bfi_cmdline "$root")")"
 }
 
 bfi_live_disk() {

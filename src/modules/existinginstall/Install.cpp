@@ -64,6 +64,7 @@ parseScanOutput( const QString& output )
             i.data = f.value( QStringLiteral( "data" ) );
             i.espUuid = f.value( QStringLiteral( "esp_uuid" ) );
             i.efiId = f.value( QStringLiteral( "efi_id" ) );
+            i.cmdline = f.value( QStringLiteral( "cmdline" ) );
             result.installs.append( i );
         }
         else if ( kind == QLatin1String( "mbr" ) )

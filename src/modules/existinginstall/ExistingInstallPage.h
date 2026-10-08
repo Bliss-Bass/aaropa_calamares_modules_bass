@@ -33,6 +33,10 @@ public:
     bool hasContent() const;
     bool isComplete() const;
 
+    /// Summary page text for an upgrade (empty for a fresh install: the partition
+    /// page describes that).
+    QString summary() const;
+
     /// Publishes the choice: bassUpgrade, dataimg, bassEfiBootloaderId, bassInstalls,
     /// bassAllowMbrReplace.
     void writeGlobalStorage() const;

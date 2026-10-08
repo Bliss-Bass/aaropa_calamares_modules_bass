@@ -165,6 +165,37 @@ ExistingInstallPage::selectedInstall() const
     return &m_scan.installs.at( row );
 }
 
+QString
+ExistingInstallPage::summary() const
+{
+    const InstallInfo* i = selectedInstall();
+    if ( !m_scanned || !m_upgrade->isChecked() || !i )
+    {
+        return QString();
+    }
+    QStringList lines;
+    lines << tr( "Upgrade %1." ).arg( describe( *i ).toHtmlEscaped() );
+    if ( m_scan.hasNewSystem && !m_scan.newSystem.display.isEmpty() )
+    {
+        lines << tr( "New system: %1." ).arg( m_scan.newSystem.display.toHtmlEscaped() );
+    }
+    lines << tr( "Nothing is partitioned or formatted. Apps, data and settings are kept." );
+    lines << ( m_keepBootOptions->isChecked() ? tr( "Boot options: kept (shown on the options page)." )
+                                             : tr( "Boot options: chosen on the options page." ) );
+    if ( m_isEfi )
+    {
+        lines << ( i->efiId.isEmpty()
+                       ? tr( "Boot loader: a new EFI boot entry is added; the boot order is not changed." )
+                       : tr( "Boot loader: updated in EFI/%1; the boot order is not changed." )
+                             .arg( i->efiId.toHtmlEscaped() ) );
+    }
+    else
+    {
+        lines << tr( "Boot loader: the boot code on the disk is kept." );
+    }
+    return lines.join( QStringLiteral( "<br/>" ) );
+}
+
 bool
 ExistingInstallPage::isComplete() const
 {
@@ -256,6 +287,8 @@ ExistingInstallPage::writeGlobalStorage() const
         upgrade.insert( QStringLiteral( "fs" ), i->fs );
         upgrade.insert( QStringLiteral( "disk" ), i->disk );
         upgrade.insert( QStringLiteral( "keepBootOptions" ), m_keepBootOptions->isChecked() );
+        // The options page pre-selects these instead of its defaults.
+        upgrade.insert( QStringLiteral( "cmdline" ), m_keepBootOptions->isChecked() ? i->cmdline : QString() );
         upgrade.insert( QStringLiteral( "wipeData" ), false );
         upgrade.insert( QStringLiteral( "espUuid" ), i->espUuid );
         upgrade.insert( QStringLiteral( "efiId" ), i->efiId );

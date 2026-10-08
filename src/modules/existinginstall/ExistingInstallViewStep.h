@@ -32,6 +32,7 @@ public:
     ~ExistingInstallViewStep() override;
 
     QString prettyName() const override;
+    QString prettyStatus() const override;
     QWidget* widget() override;
 
     bool isNextEnabled() const override;

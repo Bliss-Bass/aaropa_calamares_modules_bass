@@ -31,7 +31,8 @@ static const char scanOutput[]
       "mbr\tdisk=/dev/sdb\towner=grub\tlive=1\n"
       "mbr\tdisk=/dev/sdc\towner=empty\tlive=0\n"
       "install\tdevice=/dev/sda3\tuuid=1111\tfs=ext4\tdisk=/dev/sda\tlabel=Bass OS\tsize=64000000000\t"
-      "slot=_b\tsdk=36\trelease=16\tdate=1759000000\tdisplay=Bass 16 old\tdata=img\tesp_uuid=AB-CD\tefi_id=BassOS\n"
+      "slot=_b\tsdk=36\trelease=16\tdate=1759000000\tdisplay=Bass 16 old\tdata=img\tesp_uuid=AB-CD\tefi_id=BassOS\t"
+      "cmdline=quiet SET_RMB=true DATA=data.img\n"
       "garbage line\n"
       "install\tuuid=no-device\n";
 
@@ -51,6 +52,7 @@ ExistingInstallTests::testParse()
     QCOMPARE( i.data, QStringLiteral( "img" ) );
     QCOMPARE( i.espUuid, QStringLiteral( "AB-CD" ) );
     QCOMPARE( i.efiId, QStringLiteral( "BassOS" ) );
+    QCOMPARE( i.cmdline, QStringLiteral( "quiet SET_RMB=true DATA=data.img" ) );
     QCOMPARE( i.size, qint64( 64000000000 ) );
     QCOMPARE( r.mbrs.count(), 3 );
 }

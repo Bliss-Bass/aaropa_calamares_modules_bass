@@ -36,6 +36,7 @@ struct InstallInfo
     QString data;  ///< img, dir or none
     QString espUuid;
     QString efiId;
+    QString cmdline;  ///< kernel options in its android.cfg (empty when not GRUB-safe)
 };
 
 /// Boot code found at the start of a disk (relevant on BIOS machines).

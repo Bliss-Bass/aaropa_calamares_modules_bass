@@ -55,6 +55,12 @@ ExistingInstallViewStep::prettyName() const
     return tr( "Existing installation" );
 }
 
+QString
+ExistingInstallViewStep::prettyStatus() const
+{
+    return m_widget->summary();
+}
+
 QWidget*
 ExistingInstallViewStep::widget()
 {
